@@ -61,6 +61,29 @@ SECRET_PATTERNS = [
     (re.compile(r'eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_.+/=]*'), "HARDCODED_JWT", "HIGH"),
 ]
 
+# ── Dangerous function call patterns ────────────────────────────────────────
+# LLM-only findings (SQL injection, eval, deserialization) have no database
+# safety net like CVEs do — Mistral under-reports these inconsistently.
+# This regex floor guarantees well-known dangerous one-liners are always
+# caught, language-agnostic (Java, JavaScript, Python).
+
+DANGEROUS_CALL_PATTERNS = [
+    (re.compile(r'(?i)\beval\s*\('), "EVAL_INJECTION", "HIGH"),
+    (re.compile(r'(?i)\bexec\s*\('), "EVAL_INJECTION", "HIGH"),
+    (re.compile(r'(?i)pickle\.loads?\s*\('), "INSECURE_DESERIALIZE", "HIGH"),
+    (re.compile(r'(?i)subprocess\.(run|call|popen|check_output)\s*\([^)]*shell\s*=\s*True'), "COMMAND_INJECTION", "HIGH"),
+    (re.compile(r'(?i)\bos\.system\s*\('), "COMMAND_INJECTION", "HIGH"),
+    (re.compile(r'(?i)(child_process\.)?exec(Sync)?\s*\([^)]*\+'), "COMMAND_INJECTION", "HIGH"),
+    (re.compile(r'(?i)jwt\.decode\s*\('), "BROKEN_AUTH", "HIGH"),
+    (re.compile(r'(?i)yaml\.load\s*\('), "INSECURE_DESERIALIZE", "MEDIUM"),
+    (re.compile(r'Runtime\.getRuntime\(\)\.exec\s*\('), "COMMAND_INJECTION", "HIGH"),
+    (re.compile(r'new\s+ObjectInputStream\s*\('), "INSECURE_DESERIALIZE", "HIGH"),
+    (re.compile(r'(?i)(SELECT|INSERT|UPDATE|DELETE)\b[^"\']*["\'][^"\']*["\']?\s*\+\s*\w+'), "SQL_INJECTION", "HIGH"),
+    (re.compile(r'(?i)(SELECT|INSERT|UPDATE|DELETE)\b.*[\'"]\s*%\s*\w+'), "SQL_INJECTION", "HIGH"),
+    (re.compile(r'(?i)f["\'][^"\']*?(SELECT|INSERT|UPDATE|DELETE)\b[^"\']*\{[^}]+\}'), "SQL_INJECTION", "HIGH"),
+    (re.compile(r'(?i)res\.(send|write)\s*\([^)]*req\.(query|body|params)'), "XSS_RISK", "MEDIUM"),
+]
+
 CVV_LOG_PATTERN = re.compile(r'(?i)(log|print|console)\s*[\.\(].*?(cvv|card.?number|pan|ssn)', re.DOTALL)
 
 
@@ -72,11 +95,19 @@ def regex_prefilter_node(state: dict) -> dict:
     hits = []
 
     added_lines = []
+    current_file = "unknown"
     for i, line in enumerate(diff.split("\n"), 1):
-        if line.startswith("+") and not line.startswith("+++"):
-            added_lines.append((i, line[1:]))
+        if line.startswith("diff --git"):
+            # Extract "b/path/to/file.ext" -> "path/to/file.ext"
+            parts = line.split(" ")
+            for p in parts:
+                if p.startswith("b/"):
+                    current_file = p[2:]
+                    break
+        elif line.startswith("+") and not line.startswith("+++"):
+            added_lines.append((i, line[1:], current_file))
 
-    for line_num, line_content in added_lines:
+    for line_num, line_content, file_path in added_lines:
         for pattern, finding_type, severity in SECRET_PATTERNS:
             if pattern.search(line_content):
                 hits.append({
@@ -84,7 +115,20 @@ def regex_prefilter_node(state: dict) -> dict:
                     "severity": severity,
                     "line_content": line_content.strip(),
                     "diff_line": line_num,
+                    "file": file_path,
                     "source": "regex_prefilter"
+                })
+                break
+
+        for pattern, finding_type, severity in DANGEROUS_CALL_PATTERNS:
+            if pattern.search(line_content):
+                hits.append({
+                    "type": finding_type,
+                    "severity": severity,
+                    "line_content": line_content.strip(),
+                    "diff_line": line_num,
+                    "file": file_path,
+                    "source": "regex_dangerous_call"
                 })
                 break
 
@@ -94,6 +138,7 @@ def regex_prefilter_node(state: dict) -> dict:
                 "severity": "HIGH",
                 "line_content": line_content.strip(),
                 "diff_line": line_num,
+                "file": file_path,
                 "source": "regex_prefilter"
             })
 
@@ -410,6 +455,13 @@ def _merge_regex_into_findings(llm_findings: list, prefilter_hits: list) -> list
     existing_evidence = {f.get("evidence", "").lower()[:80] for f in llm_findings}
     existing_lines = {f.get("line", -1) for f in llm_findings}
 
+    severity_confidence = {
+        "CRITICAL": 0.93,
+        "HIGH": 0.88,
+        "MEDIUM": 0.70,
+        "LOW": 0.50,
+    }
+
     for i, hit in enumerate(prefilter_hits):
         line_content_lower = hit["line_content"].lower()[:80]
         diff_line = hit.get("diff_line", 0)
@@ -425,10 +477,10 @@ def _merge_regex_into_findings(llm_findings: list, prefilter_hits: list) -> list
                 "finding_id": f"regex_{i:03d}",
                 "severity": hit["severity"],
                 "type": hit["type"],
-                "file": "unknown",
+                "file": hit.get("file", "unknown"),
                 "line": diff_line,
                 "evidence": hit["line_content"][:200],
-                "confidence": 0.88,
+                "confidence": severity_confidence.get(hit["severity"], 0.75),
                 "policy_ref": "SEC-001",
                 "remediation": "Move to environment variables or a secrets manager."
             })
@@ -438,16 +490,23 @@ def _merge_regex_into_findings(llm_findings: list, prefilter_hits: list) -> list
 
 def _prefilter_to_findings(hits: list) -> list:
     """Convert regex prefilter hits to finding format as fallback."""
+    severity_confidence = {
+        "CRITICAL": 0.92,
+        "HIGH": 0.80,
+        "MEDIUM": 0.65,
+        "LOW": 0.50,
+    }
     findings = []
     for i, hit in enumerate(hits):
+        severity = hit["severity"]
         findings.append({
             "finding_id": f"regex_{i:03d}",
-            "severity": hit["severity"],
+            "severity": severity,
             "type": hit["type"],
-            "file": "unknown",
-            "line": 0,
+            "file": hit.get("file", "unknown"),
+            "line": hit.get("diff_line", 0),
             "evidence": hit["line_content"][:200],
-            "confidence": 0.75,
+            "confidence": severity_confidence.get(severity, 0.75),
             "policy_ref": "SEC-001",
             "remediation": "Move to environment variables or secrets manager."
         })
